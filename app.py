@@ -4,6 +4,7 @@ import asyncio
 import json
 from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception_type
 
+# Use Quart, the async-native framework
 app = Quart(__name__)
 
 headers = {'Content-Type': 'application/json'}
@@ -26,24 +27,21 @@ async def fetch_single_keyword(session, base_url, keyword):
         return len(response_json.get("products", []))
 
 async def process_keywords_in_chunks(shop_id, keywords):
-    """
-    Processes the main list of keywords in smaller, more manageable chunks
-    to keep memory usage low and avoid timeouts.
-    """
     base_url = f"https://search-prod-dlp-adept-search.search-prod.adeptmind.app/search?shop_id={shop_id}"
     all_results = []
-    chunk_size = 200  # Process 200 keywords at a time
+    chunk_size = 200
 
     async with aiohttp.ClientSession() as session:
         for i in range(0, len(keywords), chunk_size):
             chunk = keywords[i:i + chunk_size]
-            print(f"Processing chunk {i//chunk_size + 1}...") # Log progress on the server
+            print(f"Processing chunk {i//chunk_size + 1}...")
             
             tasks = []
             async def wrapper(kw):
                 try:
                     return await fetch_single_keyword(session, base_url, kw)
-                except Exception:
+                except Exception as e:
+                    print(f"Error on keyword '{kw}': {e}") # Log the specific error
                     return -1
             
             for kw in chunk:
@@ -54,20 +52,23 @@ async def process_keywords_in_chunks(shop_id, keywords):
 
     return all_results
 
+# IMPORTANT: The route handler MUST be async
 @app.route('/fetch_counts', methods=['POST'])
-def handle_fetch_request():
-    request_data = request.get_json()
+async def handle_fetch_request():
+    # IMPORTANT: You MUST await the get_json() call
+    request_data = await request.get_json()
+    
     if not request_data or 'shop_id' not in request_data or 'keywords' not in request_data:
         return jsonify({"error": "Request must include 'shop_id' and 'keywords'"}), 400
     
     shop_id = request_data['shop_id']
     keywords = request_data['keywords']
     
-    # Use the new chunking processor
-    product_counts = asyncio.run(process_keywords_in_chunks(shop_id, keywords))
+    # This function is already async, so we can await it directly
+    product_counts = await process_keywords_in_chunks(shop_id, keywords)
     
     return jsonify({"product_counts": product_counts})
 
-# Gunicorn is used for production, this part is for local testing if needed.
+# This part is for local testing and not used by Render's Gunicorn
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
+    app.run()
