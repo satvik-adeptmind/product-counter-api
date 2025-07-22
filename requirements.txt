@@ -2,3 +2,4 @@ flask
 aiohttp
 tenacity
 gunicorn
+uvicorn
