@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from quart import Quart, request, jsonify
 import aiohttp
 import asyncio
 import json
