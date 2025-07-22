@@ -1,4 +1,4 @@
-flask
+quart
 aiohttp
 tenacity
 gunicorn
