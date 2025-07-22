@@ -58,7 +58,7 @@ async def process_keywords_in_chunks(shop_id, keywords, env):
         base_url = f"https://dlp-staging-search-api.retail.adeptmind.ai/search?shop_id={shop_id}"
     
     all_results = []
-    chunk_size = 200
+    chunk_size = 50
 
     async with aiohttp.ClientSession() as session:
         for i in range(0, len(keywords), chunk_size):
