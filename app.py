@@ -4,7 +4,7 @@ import asyncio
 import json
 from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception_type
 
-app = Flask(__name__)
+app = Quart(__name__)
 
 headers = {'Content-Type': 'application/json'}
 
