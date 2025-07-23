@@ -62,18 +62,22 @@ async def fetch_single_keyword_advanced(session, base_url, keyword, remove_unnec
 # BACKGROUND WORKER & SERVER-SIDE LOGIC
 # =================================================================================
 
+# In app.py, replace the entire background_task function with this:
+
 async def background_task(job_id, shop_id, keywords, env):
     """
-    This is the main worker task that runs in the background on the server.
-    It now uses a Semaphore for memory-safe concurrency.
+    This is the main worker task.
+    It now uses CHUNKING + SEMAPHORE for maximum memory safety.
     """
-    print(f"Starting ADVANCED background task for job_id: {job_id} with {len(keywords)} keywords.")
+    print(f"Starting FINAL background task for job_id: {job_id} with {len(keywords)} keywords.")
     job_database[job_id]["status"] = "processing"
     
-    # *** KEY TO STABILITY: The Semaphore ***
-    # This limits concurrent requests to a safe number (e.g., 15) to prevent memory crashes.
-    sem = asyncio.Semaphore(15)
+    # CONTROL VARIABLES
+    CONCURRENCY_LIMIT = 8  # How many requests to run at the same time.
+    CHUNK_SIZE = 50        # How many keywords to prepare at a time.
 
+    sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
+    
     try:
         base_url = f"https://search-{env}-dlp-adept-search.search-prod.adeptmind.app/search?shop_id={shop_id}"
         
@@ -81,21 +85,34 @@ async def background_task(job_id, shop_id, keywords, env):
         
         async with aiohttp.ClientSession() as session:
             
-            # This wrapper safely calls the fetching logic and is controlled by the semaphore.
             async def wrapper(kw):
-                async with sem: # The semaphore acts as a gatekeeper here
+                async with sem:
                     try:
                         return await fetch_single_keyword_advanced(session, base_url, kw)
                     except Exception as e:
-                        print(f"Error fetching keyword '{kw}': {e}")
-                        return -1 # Return -1 to indicate a failure for this specific keyword
+                        # This log is helpful for debugging specific keyword failures
+                        # print(f"Error fetching keyword '{kw}': {e}") 
+                        return -1
 
-            # Create all tasks, but the semaphore will ensure only 15 run at a time.
-            tasks = [wrapper(kw) for kw in keywords]
-            chunk_results = await asyncio.gather(*tasks)
-            all_results.extend(chunk_results)
-        
-        # When the entire job is done, store the complete results.
+            # *** THE NEW CHUNKING LOGIC ***
+            for i in range(0, len(keywords), CHUNK_SIZE):
+                chunk = keywords[i:i + CHUNK_SIZE]
+                
+                # This log will show us progress in Render's console
+                chunk_num = (i // CHUNK_SIZE) + 1
+                total_chunks = (len(keywords) + CHUNK_SIZE - 1) // CHUNK_SIZE
+                print(f"Job {job_id}: Processing chunk {chunk_num} of {total_chunks}...")
+                
+                # Create task list ONLY for the small chunk
+                tasks = [wrapper(kw) for kw in chunk]
+                
+                # Run and gather results for this chunk
+                chunk_results = await asyncio.gather(*tasks)
+                all_results.extend(chunk_results)
+
+                # Give the system a moment to breathe and perform garbage collection
+                await asyncio.sleep(1)
+
         job_database[job_id]["status"] = "complete"
         job_database[job_id]["results"] = all_results
         print(f"Job {job_id} completed successfully.")
@@ -104,7 +121,6 @@ async def background_task(job_id, shop_id, keywords, env):
         print(f"FATAL ERROR in job {job_id}: {e}")
         job_database[job_id]["status"] = "failed"
         job_database[job_id]["results"] = str(e)
-
 
 # =================================================================================
 # API ENDPOINTS (No changes needed here)
