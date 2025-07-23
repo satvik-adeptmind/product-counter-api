@@ -4,14 +4,11 @@ import asyncio
 import json
 from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception_type
 import uuid
+import random # Import the random library for sleeping
 
-# Use Quart, the async-native framework
 app = Quart(__name__)
 
-# A simple in-memory database to store job status and results.
-# This will be cleared if the server restarts, which is an acceptable trade-off.
 job_database = {}
-
 headers = {'Content-Type': 'application/json'}
 
 @retry(
@@ -20,12 +17,7 @@ headers = {'Content-Type': 'application/json'}
     retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError))
 )
 async def fetch_single_keyword_with_fallback(session, base_url, keyword, remove_unnecessary_fields=True):
-    """
-    This function contains the core, trusted logic to fetch a single product count,
-    including the fallback mechanism.
-    """
-    if not keyword or not keyword.strip():
-        return 0
+    if not keyword or not keyword.strip(): return 0
     query = keyword.strip()
     data = {"query": query, "size": 300}
     if remove_unnecessary_fields:
@@ -44,10 +36,6 @@ async def fetch_single_keyword_with_fallback(session, base_url, keyword, remove_
         return 0
 
 async def background_task(job_id, shop_id, keywords, env):
-    """
-    This is the main worker task that runs in the background on the server.
-    It processes all keywords and stores the final result in the database.
-    """
     print(f"Starting background task for job_id: {job_id} with {len(keywords)} keywords.")
     job_database[job_id] = {"status": "processing", "results": None}
     
@@ -58,8 +46,8 @@ async def background_task(job_id, shop_id, keywords, env):
             base_url = f"https://dlp-staging-search-api.retail.adeptmind.ai/search?shop_id={shop_id}"
         
         all_results = []
-        # Chunk size is set to a memory-safe value for Render's free tier.
-        chunk_size = 50
+        # Your original script used a larger chunk size with a sleep. Let's replicate that.
+        chunk_size = 1000 
         
         async with aiohttp.ClientSession() as session:
             for i in range(0, len(keywords), chunk_size):
@@ -67,17 +55,20 @@ async def background_task(job_id, shop_id, keywords, env):
                 print(f"Job {job_id}: Processing chunk {i//chunk_size + 1}...")
                 tasks = []
                 async def wrapper(kw):
-                    try:
-                        return await fetch_single_keyword_with_fallback(session, base_url, kw)
-                    except Exception:
-                        return -1
-                for kw in chunk:
-                    tasks.append(wrapper(kw))
+                    try: return await fetch_single_keyword_with_fallback(session, base_url, kw)
+                    except Exception: return -1
+                for kw in chunk: tasks.append(wrapper(kw))
                 
                 chunk_results = await asyncio.gather(*tasks)
                 all_results.extend(chunk_results)
-        
-        # When the entire job is done, store the complete results in our database.
+
+                # --- CRITICAL PERFORMANCE FIX ---
+                # If this is not the last chunk, pause to cool down.
+                if i + chunk_size < len(keywords):
+                    sleep_time = random.randint(5, 15)
+                    print(f"Job {job_id}: Chunk complete. Sleeping for {sleep_time} seconds...")
+                    await asyncio.sleep(sleep_time) # Use asyncio.sleep in an async function
+
         job_database[job_id] = {"status": "complete", "results": all_results}
         print(f"Job {job_id} completed successfully.")
 
@@ -85,27 +76,7 @@ async def background_task(job_id, shop_id, keywords, env):
         print(f"FATAL ERROR in job {job_id}: {e}")
         job_database[job_id] = {"status": "failed", "results": str(e)}
 
-# --- API Endpoints ---
-
-@app.route('/start_job', methods=['POST'])
-async def start_job_endpoint():
-    """Receives the keyword list, creates a unique job_id, starts the background task, and returns the job_id."""
-    request_data = await request.get_json()
-    if not request_data:
-        return jsonify({"error": "Invalid request"}), 400
-
-    job_id = str(uuid.uuid4())
-    
-    # Start the long-running process in the background without waiting for it.
-    asyncio.create_task(background_task(
-        job_id,
-        request_data['shop_id'],
-        request_data['keywords'],
-        request_data.get('environment', 'prod')
-    ))
-    
-    # Immediately return the job_id so the Google Sheet can save it.
-    return jsonify({"status": "success", "job_id": job_id})
+# --- API Endpoints (Unchanged) ---
 
 @app.route('/health', methods=['GET'])
 async def health_check():
@@ -115,14 +86,18 @@ async def health_check():
     """
     return jsonify({"status": "ok"}), 200
 
+@app.route('/start_job', methods=['POST'])
+async def start_job_endpoint():
+    request_data = await request.get_json()
+    if not request_data: return jsonify({"error": "Invalid request"}), 400
+    job_id = str(uuid.uuid4())
+    asyncio.create_task(background_task(job_id, request_data['shop_id'], request_data['keywords'], request_data.get('environment', 'prod')))
+    return jsonify({"status": "success", "job_id": job_id})
+
 @app.route('/get_results/<job_id>', methods=['GET'])
 async def get_results_endpoint(job_id):
-    """Allows the Google Sheet to poll for the results of a specific job."""
     job = job_database.get(job_id)
-    if not job:
-        return jsonify({"status": "not_found"}), 404
-    
-    # Return the current status and the results (if complete).
+    if not job: return jsonify({"status": "not_found"}), 404
     return jsonify(job)
 
 # This part is used by Render to start the server.
