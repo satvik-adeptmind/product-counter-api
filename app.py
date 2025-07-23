@@ -102,6 +102,14 @@ async def start_job_endpoint():
     asyncio.create_task(background_task(job_id, request_data['shop_id'], request_data['keywords'], request_data.get('environment', 'prod')))
     return jsonify({"status": "success", "job_id": job_id})
 
+@app.route('/health', methods=['GET'])
+async def health_check():
+    """
+    A simple health check endpoint that UptimeRobot can hit.
+    It returns a 200 OK status to show that the service is live.
+    """
+    return jsonify({"status": "ok"}), 200
+
 @app.route('/get_results/<job_id>', methods=['GET'])
 async def get_results_endpoint(job_id):
     job = job_database.get(job_id)
