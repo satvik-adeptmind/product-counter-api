@@ -3,65 +3,27 @@ import aiohttp
 import asyncio
 import json
 from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception_type
+import uuid
 
 # Use Quart, the async-native framework
 app = Quart(__name__)
 
+# A simple in-memory database to store job status and results.
+# This will be cleared if the server restarts, which is an acceptable trade-off.
+job_database = {}
+
 headers = {'Content-Type': 'application/json'}
 
-
-# This is the background task that does all the work
-async def background_task(shop_id, keywords, env, callback_url, sheet_url):
-    try:
-        if env == "prod":
-            base_url = f"https://search-prod-dlp-adept-search.search-prod.adeptmind.app/search?shop_id={shop_id}"
-        else:
-            base_url = f"https://dlp-staging-search-api.retail.adeptmind.ai/search?shop_id={shop_id}"
-        
-        chunk_size = 50
-
-        async with aiohttp.ClientSession() as session:
-            for i in range(0, len(keywords), chunk_size):
-                chunk = keywords[i:i + chunk_size]
-                print(f"Processing chunk for sheet {sheet_url}, starting row {i + 2}")
-                
-                tasks = []
-                # Define the worker function inside the loop
-                async def wrapper(kw):
-                    try:
-                        return await fetch_single_keyword_with_fallback(session, base_url, kw)
-                    except Exception as e:
-                        print(f"Error on keyword '{kw}': {e}")
-                        return -1
-                
-                for kw in chunk:
-                    tasks.append(wrapper(kw))
-                
-                chunk_results = await asyncio.gather(*tasks)
-
-                # Send the results of this chunk back to the Google Sheet
-                callback_payload = {
-                    "sheetUrl": sheet_url,
-                    "results": chunk_results,
-                    "startingRow": i + 2
-                }
-                print(f"Sending {len(chunk_results)} results back to {callback_url}")
-                try:
-                    await session.post(callback_url, headers=headers, data=json.dumps(callback_payload))
-                except Exception as e:
-                    print(f"ERROR sending callback: {e}")
-
-    except Exception as e:
-        print(f"FATAL ERROR in background task: {e}")
-
-
-# --- THIS IS THE FULLY DEFINED FUNCTION ---
 @retry(
     wait=wait_random_exponential(min=1, max=10),
     stop=stop_after_attempt(5),
     retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError))
 )
 async def fetch_single_keyword_with_fallback(session, base_url, keyword, remove_unnecessary_fields=True):
+    """
+    This function contains the core, trusted logic to fetch a single product count,
+    including the fallback mechanism.
+    """
     if not keyword or not keyword.strip():
         return 0
     query = keyword.strip()
@@ -81,6 +43,70 @@ async def fetch_single_keyword_with_fallback(session, base_url, keyword, remove_
             return await fetch_single_keyword_with_fallback(session, base_url, keyword, remove_unnecessary_fields=False)
         return 0
 
+async def background_task(job_id, shop_id, keywords, env):
+    """
+    This is the main worker task that runs in the background on the server.
+    It processes all keywords and stores the final result in the database.
+    """
+    print(f"Starting background task for job_id: {job_id} with {len(keywords)} keywords.")
+    job_database[job_id] = {"status": "processing", "results": None}
+    
+    try:
+        if env == "prod":
+            base_url = f"https://search-prod-dlp-adept-search.search-prod.adeptmind.app/search?shop_id={shop_id}"
+        else:
+            base_url = f"https://dlp-staging-search-api.retail.adeptmind.ai/search?shop_id={shop_id}"
+        
+        all_results = []
+        # Chunk size is set to a memory-safe value for Render's free tier.
+        chunk_size = 50
+        
+        async with aiohttp.ClientSession() as session:
+            for i in range(0, len(keywords), chunk_size):
+                chunk = keywords[i:i + chunk_size]
+                print(f"Job {job_id}: Processing chunk {i//chunk_size + 1}...")
+                tasks = []
+                async def wrapper(kw):
+                    try:
+                        return await fetch_single_keyword_with_fallback(session, base_url, kw)
+                    except Exception:
+                        return -1
+                for kw in chunk:
+                    tasks.append(wrapper(kw))
+                
+                chunk_results = await asyncio.gather(*tasks)
+                all_results.extend(chunk_results)
+        
+        # When the entire job is done, store the complete results in our database.
+        job_database[job_id] = {"status": "complete", "results": all_results}
+        print(f"Job {job_id} completed successfully.")
+
+    except Exception as e:
+        print(f"FATAL ERROR in job {job_id}: {e}")
+        job_database[job_id] = {"status": "failed", "results": str(e)}
+
+# --- API Endpoints ---
+
+@app.route('/start_job', methods=['POST'])
+async def start_job_endpoint():
+    """Receives the keyword list, creates a unique job_id, starts the background task, and returns the job_id."""
+    request_data = await request.get_json()
+    if not request_data:
+        return jsonify({"error": "Invalid request"}), 400
+
+    job_id = str(uuid.uuid4())
+    
+    # Start the long-running process in the background without waiting for it.
+    asyncio.create_task(background_task(
+        job_id,
+        request_data['shop_id'],
+        request_data['keywords'],
+        request_data.get('environment', 'prod')
+    ))
+    
+    # Immediately return the job_id so the Google Sheet can save it.
+    return jsonify({"status": "success", "job_id": job_id})
+
 @app.route('/health', methods=['GET'])
 async def health_check():
     """
@@ -89,26 +115,16 @@ async def health_check():
     """
     return jsonify({"status": "ok"}), 200
 
-# This is the API endpoint that receives the initial request
-@app.route('/fetch_counts', methods=['POST'])
-async def handle_fetch_request():
-    request_data = await request.get_json()
+@app.route('/get_results/<job_id>', methods=['GET'])
+async def get_results_endpoint(job_id):
+    """Allows the Google Sheet to poll for the results of a specific job."""
+    job = job_database.get(job_id)
+    if not job:
+        return jsonify({"status": "not_found"}), 404
     
-    if not request_data or 'callback_url' not in request_data:
-        return jsonify({"error": "Request must include a 'callback_url'"}), 400
-    
-    # Run the processing as a background task
-    asyncio.create_task(background_task(
-        shop_id=request_data['shop_id'],
-        keywords=request_data['keywords'],
-        env=request_data.get('environment', 'prod'),
-        callback_url=request_data['callback_url'],
-        sheet_url=request_data['sheet_url']
-    ))
-    
-    # Immediately return a success message
-    return jsonify({"status": "success", "message": "Job accepted and is running in the background."}), 200
+    # Return the current status and the results (if complete).
+    return jsonify(job)
 
-# This part is for local testing and not used by Render's Gunicorn
+# This part is used by Render to start the server.
 if __name__ == '__main__':
     app.run()
