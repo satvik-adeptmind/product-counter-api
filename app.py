@@ -1,20 +1,35 @@
-# app.py - Version 3 (Advanced Fetching Logic + Memory Safe Concurrency)
+# app.py - FINAL VERSION for Render Free Tier
+# This version uses a background thread within a single service.
 
-from quart import Quart, request, jsonify
 import aiohttp
 import asyncio
 import json
-from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception_type
+import os
 import uuid
-from datetime import datetime, timedelta
+from quart import Quart, request, jsonify
+import threading
+import queue
+from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception_type
 
-# Use Quart, the async-native framework
+# =================================================================================
+# 1. SETUP: In-Memory Queue and Shared Data Store (Thread-Safe)
+# =================================================================================
+
 app = Quart(__name__)
 
-# A simple in-memory database to store job status and results.
+# A thread-safe queue to hold incoming jobs. The web server adds to this.
+job_queue = queue.Queue()
+
+# A thread-safe dictionary to store job statuses and results.
+# The lock ensures that the web server and worker thread don't corrupt the data.
 job_database = {}
+db_lock = threading.Lock()
 
 headers = {'Content-Type': 'application/json'}
+
+# =================================================================================
+# 2. THE HEAVY LIFTING LOGIC (The Worker's Job)
+# =================================================================================
 
 @retry(
     wait=wait_random_exponential(min=1, max=10),
@@ -22,168 +37,109 @@ headers = {'Content-Type': 'application/json'}
     retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError))
 )
 async def fetch_single_keyword_advanced(session, base_url, keyword, remove_unnecessary_fields=True):
-    """
-    This is the new, robust fetching function inspired by your script.
-    It includes the smart fallback mechanism.
-    """
-    if not keyword or not keyword.strip():
-        return 0  # Return 0 for empty or whitespace-only keywords
-
+    if not keyword or not keyword.strip(): return 0
     query = keyword.strip()
     data = {"query": query, "size": 300}
-    
-    if remove_unnecessary_fields:
-        data["include_fields"] = ["product_id"]
+    if remove_unnecessary_fields: data["include_fields"] = ["product_id"]
 
-    async with session.post(base_url, headers=headers, data=json.dumps(data)) as response:
-        response.raise_for_status()  # Raise an error for non-2xx responses
+    async with session.post(base_url, headers=headers, data=json.dumps(data), timeout=30) as response:
+        response.raise_for_status()
         response_json = await response.json()
-        
         products = response_json.get("products", [])
         prod_count = len(products)
-
-        # Success Case: We got products, return the count.
-        if prod_count > 0:
-            return prod_count
-
-        # Failure Case 1: The API itself timed out internally. Raise to trigger a retry.
-        if "timed_out_services" in response_json:
-            raise asyncio.TimeoutError("API service timed out internally.")
-
-        # Failure Case 2: No products found, but no timeout. Try the fallback.
-        if remove_unnecessary_fields:
-            # This is the recursive fallback from your ideal script.
-            return await fetch_single_keyword_advanced(session, base_url, keyword, remove_unnecessary_fields=False)
-        
-        # Final Case: Fallback also returned no products. The count is genuinely 0.
+        if prod_count > 0: return prod_count
+        if "timed_out_services" in response_json: raise asyncio.TimeoutError("API service timed out.")
+        if remove_unnecessary_fields: return await fetch_single_keyword_advanced(session, base_url, keyword, remove_unnecessary_fields=False)
         return 0
 
-# =================================================================================
-# BACKGROUND WORKER & SERVER-SIDE LOGIC
-# =================================================================================
+async def process_job_async(job_id, job_data):
+    """The core asynchronous data processing logic."""
+    shop_id = job_data['shop_id']
+    keywords = job_data['keywords']
+    env = job_data.get('environment', 'prod')
 
-# In app.py, replace the entire background_task function with this:
-
-async def background_task(job_id, shop_id, keywords, env):
-    """
-    This is the main worker task.
-    It now uses CHUNKING + SEMAPHORE for maximum memory safety.
-    """
-    print(f"Starting FINAL background task for job_id: {job_id} with {len(keywords)} keywords.")
-    job_database[job_id]["status"] = "processing"
+    print(f"Worker processing job {job_id} with {len(keywords)} keywords.")
     
-    # CONTROL VARIABLES
-    CONCURRENCY_LIMIT = 8  # How many requests to run at the same time.
-    CHUNK_SIZE = 50        # How many keywords to prepare at a time.
+    with db_lock:
+        job_database[job_id] = {"status": "processing"}
 
-    sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
-    
     try:
         base_url = f"https://search-{env}-dlp-adept-search.search-prod.adeptmind.app/search?shop_id={shop_id}"
-        
         all_results = []
         
+        sem = asyncio.Semaphore(8) # Safely control concurrency
+        
         async with aiohttp.ClientSession() as session:
-            
             async def wrapper(kw):
                 async with sem:
-                    try:
-                        return await fetch_single_keyword_advanced(session, base_url, kw)
-                    except Exception as e:
-                        # This log is helpful for debugging specific keyword failures
-                        # print(f"Error fetching keyword '{kw}': {e}") 
-                        return -1
+                    try: return await fetch_single_keyword_advanced(session, base_url, kw)
+                    except Exception: return -1
 
-            # *** THE NEW CHUNKING LOGIC ***
-            for i in range(0, len(keywords), CHUNK_SIZE):
-                chunk = keywords[i:i + CHUNK_SIZE]
-                
-                # This log will show us progress in Render's console
-                chunk_num = (i // CHUNK_SIZE) + 1
-                total_chunks = (len(keywords) + CHUNK_SIZE - 1) // CHUNK_SIZE
-                print(f"Job {job_id}: Processing chunk {chunk_num} of {total_chunks}...")
-                
-                # Create task list ONLY for the small chunk
-                tasks = [wrapper(kw) for kw in chunk]
-                
-                # Run and gather results for this chunk
-                chunk_results = await asyncio.gather(*tasks)
-                all_results.extend(chunk_results)
+            tasks = [wrapper(kw) for kw in keywords]
+            all_results = await asyncio.gather(*tasks)
 
-                # Give the system a moment to breathe and perform garbage collection
-                await asyncio.sleep(1)
-
-        job_database[job_id]["status"] = "complete"
-        job_database[job_id]["results"] = all_results
-        print(f"Job {job_id} completed successfully.")
+        with db_lock:
+            job_database[job_id] = {"status": "complete", "results": all_results}
+        print(f"Worker finished job {job_id} successfully.")
 
     except Exception as e:
-        print(f"FATAL ERROR in job {job_id}: {e}")
-        job_database[job_id]["status"] = "failed"
-        job_database[job_id]["results"] = str(e)
+        print(f"Worker FAILED job {job_id}: {e}")
+        with db_lock:
+            job_database[job_id] = {"status": "failed", "results": str(e)}
 
 # =================================================================================
-# API ENDPOINTS (No changes needed here)
+# 3. THE WORKER THREAD (The "Factory Worker" Mind)
 # =================================================================================
 
-def cleanup_jobs():
-    """Removes jobs older than 2 hours to prevent memory leaks."""
-    now = datetime.utcnow()
-    jobs_to_delete = [
-        job_id for job_id, data in job_database.items()
-        if data.get("timestamp") and now - data["timestamp"] > timedelta(hours=2)
-    ]
-    for job_id in jobs_to_delete:
-        try:
-            del job_database[job_id]
-            print(f"Cleaned up expired job: {job_id}")
-        except KeyError:
-            pass # Job might have been deleted in another request, which is fine.
+def worker_loop():
+    """This function runs in a separate thread, processing jobs from the queue."""
+    print("Worker thread started. Waiting for jobs.")
+    while True:
+        job_id, job_data = job_queue.get() # This will block until a job is available
+        asyncio.run(process_job_async(job_id, job_data))
+        job_queue.task_done()
+
+# =================================================================================
+# 4. THE WEB SERVER (The "Receptionist" Mind)
+# =================================================================================
 
 @app.route('/start_job', methods=['POST'])
 async def start_job_endpoint():
-    """Receives the keyword list, creates a unique job_id, starts the background task, and returns the job_id."""
+    """Receives a job, puts it in the queue, and returns immediately."""
     request_data = await request.get_json()
-    if not request_data:
+    if not request_data or 'keywords' not in request_data:
         return jsonify({"error": "Invalid request"}), 400
 
-    # Run cleanup of old jobs before starting a new one.
-    cleanup_jobs()
-
     job_id = str(uuid.uuid4())
-    shop_id = request_data['shop_id']
-    keywords = request_data['keywords']
-    env = request_data.get('environment', 'prod') # Default to 'prod' if not specified
-
-    # Store initial job info
-    job_database[job_id] = {
-        "status": "queued", 
-        "results": None, 
-        "timestamp": datetime.utcnow()
-    }
     
-    asyncio.create_task(background_task(job_id, shop_id, keywords, env))
+    # This is extremely fast and uses very little memory.
+    job_queue.put((job_id, request_data))
     
+    with db_lock:
+        job_database[job_id] = {"status": "queued"}
+    
+    print(f"Web server queued job {job_id}.")
     return jsonify({"status": "success", "job_id": job_id})
+
+@app.route('/get_results/<job_id>', methods=['GET'])
+async def get_results_endpoint(job_id):
+    """Checks the shared database for the job status/results."""
+    with db_lock:
+        job = job_database.get(job_id, {"status": "not_found"})
+    return jsonify(job)
 
 @app.route('/health', methods=['GET'])
 async def health_check():
-    """A simple health check endpoint."""
     return jsonify({"status": "ok"}), 200
 
-    
-@app.route('/get_results/<job_id>', methods=['GET'])
-async def get_results_endpoint(job_id):
-    """Allows the Google Sheet to poll for the results of a specific job."""
-    job = job_database.get(job_id)
-    if not job:
-        return jsonify({"status": "not_found"}), 404
-    
-    return jsonify(job)
+# =================================================================================
+# 5. STARTUP
+# =================================================================================
 
-if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=10000)
+# Create and start the worker thread. It's a daemon, so it will exit when the main app exits.
+worker_thread = threading.Thread(target=worker_loop, daemon=True)
+worker_thread.start()
 
-
-
-
+# The main process continues on to run the web server.
+# The 'if __name__' block is not strictly necessary on Render but is good practice.
+# Render will use your Gunicorn start command.
