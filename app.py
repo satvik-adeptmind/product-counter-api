@@ -1,34 +1,29 @@
-# app.py - FINAL VERSION for Render Free Tier
-# This version uses a background thread within a single service.
+# app.py - FINAL Version 2, using Lifespan Protocol
 
 import aiohttp
 import asyncio
 import json
-import os
 import uuid
 from quart import Quart, request, jsonify
-import threading
-import queue
 from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception_type
 
 # =================================================================================
-# 1. SETUP: In-Memory Queue and Shared Data Store (Thread-Safe)
+# 1. SETUP: Use asyncio-native tools
 # =================================================================================
 
 app = Quart(__name__)
 
-# A thread-safe queue to hold incoming jobs. The web server adds to this.
-job_queue = queue.Queue()
+# An asyncio-native queue. More natural for a Quart app.
+job_queue = asyncio.Queue()
 
-# A thread-safe dictionary to store job statuses and results.
-# The lock ensures that the web server and worker thread don't corrupt the data.
+# Simple dictionary for results. Since asyncio is single-threaded,
+# we don't need locks for this.
 job_database = {}
-db_lock = threading.Lock()
 
 headers = {'Content-Type': 'application/json'}
 
 # =================================================================================
-# 2. THE HEAVY LIFTING LOGIC (The Worker's Job)
+# 2. THE WORKER LOGIC (Runs in the background)
 # =================================================================================
 
 @retry(
@@ -53,93 +48,75 @@ async def fetch_single_keyword_advanced(session, base_url, keyword, remove_unnec
         return 0
 
 async def process_job_async(job_id, job_data):
-    """The core asynchronous data processing logic."""
-    shop_id = job_data['shop_id']
-    keywords = job_data['keywords']
+    """The core data processing logic."""
+    shop_id, keywords = job_data['shop_id'], job_data['keywords']
     env = job_data.get('environment', 'prod')
 
-    print(f"Worker processing job {job_id} with {len(keywords)} keywords.")
-    
-    with db_lock:
-        job_database[job_id] = {"status": "processing"}
+    print(f"Worker is now PROCESSING job {job_id} with {len(keywords)} keywords.")
+    job_database[job_id] = {"status": "processing"}
 
     try:
         base_url = f"https://search-{env}-dlp-adept-search.search-prod.adeptmind.app/search?shop_id={shop_id}"
-        all_results = []
-        
-        sem = asyncio.Semaphore(8) # Safely control concurrency
+        sem = asyncio.Semaphore(8)
         
         async with aiohttp.ClientSession() as session:
             async def wrapper(kw):
                 async with sem:
                     try: return await fetch_single_keyword_advanced(session, base_url, kw)
                     except Exception: return -1
-
             tasks = [wrapper(kw) for kw in keywords]
-            all_results = await asyncio.gather(*tasks)
-
-        with db_lock:
-            job_database[job_id] = {"status": "complete", "results": all_results}
-        print(f"Worker finished job {job_id} successfully.")
+            results = await asyncio.gather(*tasks)
+        
+        job_database[job_id] = {"status": "complete", "results": results}
+        print(f"Worker has FINISHED job {job_id}.")
 
     except Exception as e:
         print(f"Worker FAILED job {job_id}: {e}")
-        with db_lock:
-            job_database[job_id] = {"status": "failed", "results": str(e)}
+        job_database[job_id] = {"status": "failed", "results": str(e)}
 
-# =================================================================================
-# 3. THE WORKER THREAD (The "Factory Worker" Mind)
-# =================================================================================
-
-def worker_loop():
-    """This function runs in a separate thread, processing jobs from the queue."""
-    print("Worker thread started. Waiting for jobs.")
+async def worker_loop():
+    """The main background task loop."""
+    print("Background worker task has started. Waiting for jobs.")
     while True:
-        job_id, job_data = job_queue.get() # This will block until a job is available
-        asyncio.run(process_job_async(job_id, job_data))
+        job_id, job_data = await job_queue.get()
+        await process_job_async(job_id, job_data)
         job_queue.task_done()
 
 # =================================================================================
-# 4. THE WEB SERVER (The "Receptionist" Mind)
+# 3. LIFESPAN MANAGEMENT (The key to making this work)
+# =================================================================================
+
+@app.before_serving
+async def startup():
+    """This function runs ONCE when the application starts up."""
+    print("Application starting up. Launching the background worker task.")
+    # This creates the worker task inside the correct, running event loop.
+    asyncio.create_task(worker_loop())
+
+# =================================================================================
+# 4. THE WEB SERVER ENDPOINTS
 # =================================================================================
 
 @app.route('/start_job', methods=['POST'])
 async def start_job_endpoint():
-    """Receives a job, puts it in the queue, and returns immediately."""
+    """Receives a job, puts it in the async queue."""
     request_data = await request.get_json()
     if not request_data or 'keywords' not in request_data:
         return jsonify({"error": "Invalid request"}), 400
 
     job_id = str(uuid.uuid4())
+    await job_queue.put((job_id, request_data))
+    job_database[job_id] = {"status": "queued"}
     
-    # This is extremely fast and uses very little memory.
-    job_queue.put((job_id, request_data))
-    
-    with db_lock:
-        job_database[job_id] = {"status": "queued"}
-    
-    print(f"Web server queued job {job_id}.")
+    print(f"Web server queued job {job_id}. The background worker will pick it up.")
     return jsonify({"status": "success", "job_id": job_id})
 
 @app.route('/get_results/<job_id>', methods=['GET'])
 async def get_results_endpoint(job_id):
     """Checks the shared database for the job status/results."""
-    with db_lock:
-        job = job_database.get(job_id, {"status": "not_found"})
+    job = job_database.get(job_id, {"status": "not_found"})
     return jsonify(job)
 
 @app.route('/health', methods=['GET'])
 async def health_check():
     return jsonify({"status": "ok"}), 200
-
-# =================================================================================
-# 5. STARTUP
-# =================================================================================
-
-# Create and start the worker thread. It's a daemon, so it will exit when the main app exits.
-worker_thread = threading.Thread(target=worker_loop, daemon=True)
-worker_thread.start()
-
-# The main process continues on to run the web server.
-# The 'if __name__' block is not strictly necessary on Render but is good practice.
-# Render will use your Gunicorn start command.
