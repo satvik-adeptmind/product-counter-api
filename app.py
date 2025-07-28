@@ -57,7 +57,7 @@ async def process_job_async(job_id, job_data):
 
     try:
         base_url = f"https://search-{env}-dlp-adept-search.search-prod.adeptmind.app/search?shop_id={shop_id}"
-        sem = asyncio.Semaphore(16)
+        sem = asyncio.Semaphore(32)
         
         async with aiohttp.ClientSession() as session:
             async def wrapper(kw):
